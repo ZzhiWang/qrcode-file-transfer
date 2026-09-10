@@ -69,6 +69,14 @@
     <button id="pickDir">选择文件夹</button>
     <input id="fileInput" type="file" multiple hidden>
     <input id="dirInput" type="file" webkitdirectory hidden>
+    <label class="inline">每分片帧数
+      <select id="segFrames">
+        <option value="40">40</option>
+        <option value="60" selected>60</option>
+        <option value="80">80</option>
+        <option value="120">120</option>
+      </select>
+    </label>
     <label class="inline">帧率
       <select id="fps">
         <option value="5">5</option>
@@ -79,6 +87,8 @@
     </label>
     <button id="start" class="primary" disabled>开始传输</button>
     <button id="stop" class="danger" disabled>停止</button>
+    <button id="prevSeg" disabled>上一分片</button>
+    <button id="nextSeg" disabled>下一分片</button>
   </header>
 
   <main>
@@ -91,6 +101,7 @@
       <div class="drop-hint">松开以添加文件</div>
     </div>
     <div class="statusbar">
+      <span>分片 <b id="segInfo">-</b></span>
       <span>帧 <b id="frameNo">-</b> / <span id="totalFrames">-</span></span>
       <span>已播放 <b id="rounds">0</b> 轮</span>
       <span>预计耗时 <b id="eta">-</b></span>
@@ -2405,9 +2416,10 @@ var qrcode = function() {
 
     var MAX_BYTES = 20 * 1024 * 1024;
     var MAX_TEXT_BYTES = 1024 * 1024;
+    var SHA_LEN = 64;
     var QUIET = 4;
-    var HEADER_LEN = 19;
-    var CHUNK_MAX = 2953 - HEADER_LEN; // 2934
+    var HEADER_LEN = 23;
+    var CHUNK_MAX = 2953 - HEADER_LEN; // 2930
 
     var COMPRESSED_EXT = /\.(zip|7z|rar|gz|bz2|xz|zst|jpg|jpeg|png|gif|webp|avif|heic|mp3|aac|ogg|opus|flac|mp4|mov|mkv|webm|avi|pdf|docx|xlsx|pptx|odt|ods|odp)$/i;
 
@@ -2489,14 +2501,16 @@ var qrcode = function() {
     function u16be(n) { return [n >>> 8, n & 0xff]; }
     function u32be(n) { return [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]; }
 
-    function encodeFrame(frameIndex, totalFrames, chunk) {
+    function encodeFrame(segIndex, segTotal, frameIndex, totalFrames, chunk) {
       var head = new Uint8Array(HEADER_LEN);
       head[0] = 0x46; head[1] = 0x54; head[2] = 0x30; head[3] = 0x31; // FT01
-      head[4] = 2;
-      var hi = u32be(frameIndex); head.set(hi, 5);
-      var ht = u32be(totalFrames); head.set(ht, 9);
-      var hl = u16be(chunk.length); head.set(hl, 13);
-      var hc = u32be(crc32(chunk)); head.set(hc, 15);
+      head[4] = 3;
+      head.set(u16be(segIndex), 5);
+      head.set(u16be(segTotal), 7);
+      head.set(u32be(frameIndex), 9);
+      head.set(u32be(totalFrames), 13);
+      head.set(u16be(chunk.length), 17);
+      head.set(u32be(crc32(chunk)), 19);
       return concatBytes([head, chunk]);
     }
 
@@ -2591,7 +2605,9 @@ var qrcode = function() {
 
     // UI state
     var selectedFiles = [];
-    var chunks = [];
+    var segments = [];
+    var currentSeg = 0;
+    var segTotal = 0;
     var payload = null;
     var downloadName = "";
     var shaHex = "";
@@ -2609,11 +2625,15 @@ var qrcode = function() {
       pickFiles: document.getElementById("pickFiles"),
       pickDir: document.getElementById("pickDir"),
       fps: document.getElementById("fps"),
+      segFrames: document.getElementById("segFrames"),
       start: document.getElementById("start"),
       stop: document.getElementById("stop"),
+      prevSeg: document.getElementById("prevSeg"),
+      nextSeg: document.getElementById("nextSeg"),
       filebar: document.getElementById("filebar"),
       qrWrap: document.getElementById("qrWrap"),
       canvas: document.getElementById("qrCanvas"),
+      segInfo: document.getElementById("segInfo"),
       frameNo: document.getElementById("frameNo"),
       totalFrames: document.getElementById("totalFrames"),
       rounds: document.getElementById("rounds"),
@@ -2637,8 +2657,9 @@ var qrcode = function() {
     }
 
     function updateEta() {
-      if (!chunks.length) { el.eta.textContent = "-"; return; }
-      el.eta.textContent = formatDuration(chunks.length / parseInt(el.fps.value, 10)) + " / 轮";
+      var n = segments.length ? segments[currentSeg].length : 0;
+      if (!n) { el.eta.textContent = "-"; return; }
+      el.eta.textContent = formatDuration(n / parseInt(el.fps.value, 10)) + " / 分片轮";
     }
 
     function selectedTotalBytes() {
@@ -2687,14 +2708,18 @@ var qrcode = function() {
 
     function resetPlayback() {
       stopPlayback();
-      chunks = []; payload = null; downloadName = ""; shaHex = "";
+      segments = []; currentSeg = 0; segTotal = 0;
+      payload = null; downloadName = ""; shaHex = "";
       current = 0; rounds = 0;
+      el.segInfo.textContent = "-";
       el.frameNo.textContent = "-";
       el.totalFrames.textContent = "-";
       el.rounds.textContent = "0";
       el.eta.textContent = "-";
       el.sha.textContent = "-";
       el.stateText.textContent = "待开始";
+      el.prevSeg.disabled = true;
+      el.nextSeg.disabled = true;
       var ctx = el.canvas.getContext("2d");
       ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, el.canvas.width, el.canvas.height);
     }
@@ -2736,24 +2761,46 @@ var qrcode = function() {
       return { payload: payload, downloadName: downloadName, kind: 0 };
     }
 
-    function buildStream(payload, name, kind) {
+    function buildSegmentMeta(kind, name, segLen, segSha, wholeLen, wholeSha) {
       var nameBytes = new TextEncoder().encode(name.slice(0, 200));
-      var shaBytes = new TextEncoder().encode(shaHex);
-      var meta = new Uint8Array(1 + 2 + nameBytes.length + 4 + shaBytes.length);
+      var segShaBytes = new TextEncoder().encode(segSha);
+      var wholeShaBytes = new TextEncoder().encode(wholeSha);
+      var meta = new Uint8Array(1 + 2 + nameBytes.length + 4 + SHA_LEN + 4 + SHA_LEN);
       var dv = new DataView(meta.buffer);
-      dv.setUint8(0, kind);
-      dv.setUint16(1, nameBytes.length);
-      meta.set(nameBytes, 3);
-      dv.setUint32(3 + nameBytes.length, payload.length);
-      meta.set(shaBytes, 3 + nameBytes.length + 4);
-      return concatBytes([meta, payload]);
+      var p = 0;
+      dv.setUint8(0, kind); p = 1;
+      dv.setUint16(p, nameBytes.length); p += 2;
+      meta.set(nameBytes, p); p += nameBytes.length;
+      dv.setUint32(p, segLen); p += 4;
+      meta.set(segShaBytes, p); p += SHA_LEN;
+      dv.setUint32(p, wholeLen); p += 4;
+      meta.set(wholeShaBytes, p);
+      return meta;
     }
 
-    function splitChunks(stream) {
-      chunks = [];
-      for (var i = 0; i < stream.length; i += CHUNK_MAX) {
-        chunks.push(stream.subarray(i, Math.min(i + CHUNK_MAX, stream.length)));
+    function buildSegments(payload, name, kind) {
+      var wholeLen = payload.length;
+      var wholeSha = sha256Hex(payload);
+      var framesPerSeg = parseInt(el.segFrames.value, 10);
+      var segByteLen = framesPerSeg * CHUNK_MAX;
+      var segTotal = Math.max(1, Math.ceil(payload.length / segByteLen));
+      var out = [];
+      for (var s = 0; s < segTotal; s++) {
+        var start = s * segByteLen;
+        var end = Math.min(payload.length, start + segByteLen);
+        var segBytes = payload.subarray(start, end);
+        var segSha = sha256Hex(segBytes);
+        var meta = buildSegmentMeta(kind, name, segBytes.length, segSha, wholeLen, wholeSha);
+        var stream = concatBytes([meta, segBytes]);
+        var totalFrames = Math.ceil(stream.length / CHUNK_MAX);
+        var frames = [];
+        for (var i = 0, idx = 0; i < stream.length; i += CHUNK_MAX, idx++) {
+          var chunk = stream.subarray(i, Math.min(i + CHUNK_MAX, stream.length));
+          frames.push(encodeFrame(s, segTotal, idx, totalFrames, chunk));
+        }
+        out.push(frames);
       }
+      return { segments: out, segTotal: segTotal };
     }
 
     async function startTransfer() {
@@ -2765,12 +2812,14 @@ var qrcode = function() {
         payload = prep.payload;
         downloadName = prep.downloadName;
         shaHex = sha256Hex(payload);
-        var stream = buildStream(payload, downloadName, prep.kind);
-        splitChunks(stream);
-        el.totalFrames.textContent = chunks.length;
+        var built = buildSegments(payload, downloadName, prep.kind);
+        segments = built.segments;
+        segTotal = built.segTotal;
+        currentSeg = 0;
+        updateSegInfo();
+        el.totalFrames.textContent = segments[0].length;
         el.sha.textContent = shaHex;
-        el.stateText.textContent = "播放中";
-        el.stop.disabled = false;
+        el.stateText.textContent = "播放分片 1/" + segTotal;
         updateEta();
         startPlayback();
       } catch (e) {
@@ -2781,11 +2830,21 @@ var qrcode = function() {
       }
     }
 
+    function updateSegInfo() {
+      el.segInfo.textContent = (currentSeg + 1) + " / " + segTotal;
+      el.prevSeg.disabled = currentSeg <= 0;
+      el.nextSeg.disabled = currentSeg >= segTotal - 1;
+    }
+
     function startPlayback() {
       playing = true;
       current = 0;
       rounds = 0;
       lastTs = 0;
+      el.stop.disabled = false;
+      el.totalFrames.textContent = segments[currentSeg].length;
+      updateSegInfo();
+      el.stateText.textContent = "播放分片 " + (currentSeg + 1) + "/" + segTotal;
       rafId = requestAnimationFrame(tick);
     }
 
@@ -2796,6 +2855,12 @@ var qrcode = function() {
       el.stop.disabled = true;
     }
 
+    function playSegmentAt(idx) {
+      if (idx < 0 || idx >= segTotal) return;
+      currentSeg = idx;
+      startPlayback();
+    }
+
     function tick(ts) {
       if (!playing) return;
       if (ts - lastTs >= 1000 / parseInt(el.fps.value, 10)) {
@@ -2803,13 +2868,13 @@ var qrcode = function() {
         drawFrame(current);
         el.frameNo.textContent = current;
         current++;
-        if (current >= chunks.length) { current = 0; rounds++; el.rounds.textContent = rounds; }
+        if (current >= segments[currentSeg].length) { current = 0; rounds++; el.rounds.textContent = rounds; }
       }
       rafId = requestAnimationFrame(tick);
     }
 
     function drawFrame(idx) {
-      var frame = encodeFrame(idx, chunks.length, chunks[idx]);
+      var frame = segments[currentSeg][idx];
       var bin = String.fromCharCode.apply(null, frame);
       var qr = qrcode(40, "L");
       qr.addData(bin, "Byte");
@@ -2864,6 +2929,9 @@ var qrcode = function() {
     el.textArea.addEventListener("input", updateModeUI);
     el.start.addEventListener("click", startTransfer);
     el.stop.addEventListener("click", stopPlayback);
+    el.prevSeg.addEventListener("click", function () { playSegmentAt(currentSeg - 1); });
+    el.nextSeg.addEventListener("click", function () { playSegmentAt(currentSeg + 1); });
+    el.segFrames.addEventListener("change", function () { resetPlayback(); });
     el.fps.addEventListener("change", updateEta);
 
     window.addEventListener("dragover", function (e) { e.preventDefault(); el.qrWrap.classList.add("dragover"); });
