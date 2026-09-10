@@ -2420,9 +2420,8 @@ var qrcode = function() {
     var SHA_LEN = 64;
     var QUIET = 4;
     var HEADER_LEN = 23;
-    // 二维码内为 base64(整帧)，需保证 base64 后 <= 2953 字节。
-    // base64(2214 字节)=2952 字符，因此帧最多 2214 字节，chunk 最多 2191 字节。
-    var CHUNK_MAX = 2191;
+    // 二维码内为原始二进制字节串，单帧容量 2953，帧头 23，故 chunk 最多 2930 字节。
+    var CHUNK_MAX = 2953 - HEADER_LEN; // 2930
 
     var COMPRESSED_EXT = /\.(zip|7z|rar|gz|bz2|xz|zst|jpg|jpeg|png|gif|webp|avif|heic|mp3|aac|ogg|opus|flac|mp4|mov|mkv|webm|avi|pdf|docx|xlsx|pptx|odt|ods|odp)$/i;
 
@@ -2504,14 +2503,10 @@ var qrcode = function() {
     function u16be(n) { return [n >>> 8, n & 0xff]; }
     function u32be(n) { return [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]; }
 
-    function bytesToBase64(bytes) {
-      return btoa(String.fromCharCode.apply(null, bytes));
-    }
-
     function encodeFrame(segIndex, segTotal, frameIndex, totalFrames, chunk) {
       var head = new Uint8Array(HEADER_LEN);
       head[0] = 0x46; head[1] = 0x54; head[2] = 0x30; head[3] = 0x31; // FT01
-      head[4] = 4;
+      head[4] = 5;
       head.set(u16be(segIndex), 5);
       head.set(u16be(segTotal), 7);
       head.set(u32be(frameIndex), 9);
@@ -2895,7 +2890,7 @@ var qrcode = function() {
 
     function drawFrame(idx) {
       var frame = segments[currentSeg][idx];
-      var bin = bytesToBase64(frame);
+      var bin = String.fromCharCode.apply(null, frame);
       var qr = qrcode(40, "L");
       qr.addData(bin, "Byte");
       qr.make();
