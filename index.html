@@ -78,10 +78,17 @@
       </select>
     </label>
     <button id="reset">重置</button>
+    <label class="inline">解码引擎
+      <select id="decoder">
+        <option value="auto" selected>自动</option>
+        <option value="native">原生</option>
+        <option value="jsqr">jsQR</option>
+      </select>
+    </label>
     <label class="inline">识别精度
       <select id="scanWidth">
-        <option value="640">极速（640）</option>
-        <option value="960" selected>流畅（960）</option>
+        <option value="640" selected>极速（640）</option>
+        <option value="960">流畅（960）</option>
         <option value="1280">均衡（1280）</option>
         <option value="1920">高精度（1920）</option>
       </select>
@@ -101,6 +108,7 @@
       <span>本分片帧 <b id="got">0</b> / <span id="total">-</span></span>
       <span>缺失 <b id="missing">0</b></span>
       <span>CRC 错误 <b id="crcErr">0</b></span>
+      <span>引擎 <b id="engineInfo">-</b></span>
       <span>识别帧率 <b id="fpsVal">0</b></span>
       <span>状态 <b id="stateText">未开始</b></span>
     </div>
@@ -10301,6 +10309,18 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       return out;
     }
 
+    function base64ToBytes(b64) {
+      var bin = atob(b64);
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xff;
+      return bytes;
+    }
+
+    async function inflateZlib(bytes) {
+      var stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+
     function parseMeta(bytes) {
       if (bytes.length < META_FIXED + 1) return null;
       var kind = bytes[0];
@@ -10330,6 +10350,20 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     var fpsCount = 0;
     var fpsWindowStart = 0;
     var parseAborted = false;
+    var nativeDetector = null;
+    var nativeAvailable = false;
+    var nativeBusy = false;
+    var nativeBroken = false;
+    var nativeFailures = 0;
+
+    try {
+      if (typeof BarcodeDetector !== "undefined") {
+        nativeDetector = new BarcodeDetector({ formats: ["qr_code"] });
+        nativeAvailable = true;
+      }
+    } catch (e) {
+      nativeAvailable = false;
+    }
 
     var el = {
       video: document.getElementById("video"),
@@ -10341,6 +10375,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       videoInput: document.getElementById("videoInput"),
       videoStep: document.getElementById("videoStep"),
       videoStepLabel: document.getElementById("videoStepLabel"),
+      decoder: document.getElementById("decoder"),
       reset: document.getElementById("reset"),
       scanWidth: document.getElementById("scanWidth"),
       progress: document.getElementById("progress"),
@@ -10350,6 +10385,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       total: document.getElementById("total"),
       missing: document.getElementById("missing"),
       crcErr: document.getElementById("crcErr"),
+      engineInfo: document.getElementById("engineInfo"),
       fpsVal: document.getElementById("fpsVal"),
       stateText: document.getElementById("stateText"),
       doneBox: document.getElementById("doneBox"),
@@ -10374,6 +10410,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       el.segDone.textContent = "0";
       el.total.textContent = "-";
       el.crcErr.textContent = "0";
+      el.engineInfo.textContent = "-";
       el.stateText.textContent = "等待扫描";
       el.doneBox.style.display = "none";
       el.fileAction.style.display = "none";
@@ -10399,7 +10436,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
     function handleFrame(bytes) {
       if (bytes.length < HEADER_LEN) return false;
-      if (bytes[0] !== 0x46 || bytes[1] !== 0x54 || bytes[2] !== 0x30 || bytes[3] !== 0x31 || bytes[4] !== 3) return false;
+      if (bytes[0] !== 0x46 || bytes[1] !== 0x54 || bytes[2] !== 0x30 || bytes[3] !== 0x31 || bytes[4] !== 4) return false;
       var segIndex = (bytes[5] << 8) | bytes[6];
       var segTotal = (bytes[7] << 8) | bytes[8];
       var frameIndex = ((bytes[9] << 24) | (bytes[10] << 16) | (bytes[11] << 8) | bytes[12]) >>> 0;
@@ -10460,7 +10497,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       }
     }
 
-    function finalize() {
+    async function finalize() {
       var parts = [];
       for (var i = 0; i < wholeMeta.segTotal; i++) {
         if (!segments[i]) { el.stateText.textContent = "缺少分片 " + (i + 1); return; }
@@ -10470,16 +10507,25 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       if (payload.length !== wholeMeta.wholeLen) { el.stateText.textContent = "整文件长度不匹配"; return; }
       if (sha256Hex(payload) !== wholeMeta.wholeSha) { el.stateText.textContent = "整文件 SHA-256 校验失败"; return; }
       el.stateText.textContent = "全部接收完成，校验通过";
-      if (wholeMeta.kind === 1) {
-        var text = new TextDecoder().decode(payload);
+      if (wholeMeta.kind === 1 || wholeMeta.kind === 2) {
+        var textPayload = payload;
+        if (wholeMeta.kind === 2) {
+          try {
+            textPayload = await inflateZlib(payload);
+          } catch (e) {
+            el.stateText.textContent = "文字解压失败";
+            return;
+          }
+        }
+        var text = new TextDecoder().decode(textPayload);
         el.textOut.value = text;
-        var textBlob = new Blob([payload], { type: "text/plain;charset=utf-8" });
+        var textBlob = new Blob([textPayload], { type: "text/plain;charset=utf-8" });
         el.saveTextLink.href = URL.createObjectURL(textBlob);
         el.saveTextLink.download = wholeMeta.name || "文字内容.txt";
         el.fileAction.style.display = "none";
         el.textAction.style.display = "block";
         el.doneInfo.innerHTML = "文字内容（UTF-8）：<br>" +
-          "大小：" + fmtSize(payload.length) + "<br>" +
+          "大小：" + fmtSize(textPayload.length) + "<br>" +
           "SHA-256：<span class='mono'>" + wholeMeta.wholeSha + "</span>";
       } else {
         var blob = new Blob([payload], { type: "application/zip" });
@@ -10527,9 +10573,13 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       ctx.drawImage(videoEl, 0, 0, dw, dh);
       var img = ctx.getImageData(0, 0, dw, dh);
       var res = jsQR(img.data, dw, dh, { inversionAttempts: "dontInvert" });
-      if (res && res.binaryData && res.binaryData.length) {
+      if (res && res.data) {
         fpsCount++;
-        handleFrame(Uint8Array.from(res.binaryData));
+        handleFrame(base64ToBytes(res.data));
+      } else if (res && res.binaryData && res.binaryData.length) {
+        fpsCount++;
+        var bin = String.fromCharCode.apply(null, res.binaryData);
+        handleFrame(base64ToBytes(bin));
       }
     }
 
@@ -10564,6 +10614,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         el.hint.style.display = "none";
         el.startCam.disabled = true;
         scanning = true;
+        el.engineInfo.textContent = useNative() ? "原生" : "jsQR";
         fpsCount = 0;
         fpsWindowStart = performance.now();
         rafId = requestAnimationFrame(scanLoop);
@@ -10574,11 +10625,41 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       }
     }
 
+    function useNative() {
+      if (el.decoder.value === "jsqr") return false;
+      if (el.decoder.value === "native") return nativeAvailable;
+      return nativeAvailable && !nativeBroken;
+    }
+
+    async function tryNativeDetect() {
+      if (nativeBusy || !nativeDetector) return;
+      nativeBusy = true;
+      try {
+        var codes = await nativeDetector.detect(el.video);
+        if (codes && codes.length) {
+          for (var i = 0; i < codes.length; i++) {
+            if (codes[i] && codes[i].rawValue) {
+              fpsCount++;
+              handleFrame(base64ToBytes(codes[i].rawValue));
+            }
+          }
+        }
+      } catch (e) {
+        nativeFailures++;
+        if (nativeFailures >= 5) {
+          nativeBroken = true;
+          el.engineInfo.textContent = "jsQR(回退)";
+        }
+      }
+      finally { nativeBusy = false; }
+    }
+
     function scanLoop(ts) {
       if (!scanning) return;
       if (ts - lastScan >= 1000 / 20 && el.video.readyState >= 2) {
         lastScan = ts;
-        grabAndDecode(el.video);
+        if (useNative()) tryNativeDetect();
+        else grabAndDecode(el.video);
       }
       if (ts - fpsWindowStart >= 1000) {
         el.fpsVal.textContent = fpsCount;
@@ -10633,11 +10714,26 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       var duration = el.video.duration;
       var stepSec = parseInt(el.videoStep.value, 10) / 1000;
       var completed = false;
+      el.engineInfo.textContent = useNative() ? "原生" : "jsQR";
       el.stateText.textContent = "解析视频…";
       for (var pass = 0; pass < 3 && !completed && !parseAborted; pass++) {
         for (var t = 0; t <= duration && !completed && !parseAborted; t += stepSec) {
           await seekTo(el.video, Math.min(t, duration));
-          grabAndDecode(el.video);
+          if (useNative()) {
+            try {
+              var codes = await nativeDetector.detect(el.video);
+              if (codes && codes.length) {
+                for (var ci = 0; ci < codes.length; ci++) {
+                  if (codes[ci] && codes[ci].rawValue) {
+                    fpsCount++;
+                    handleFrame(base64ToBytes(codes[ci].rawValue));
+                  }
+                }
+              }
+            } catch (e) { /* ignore */ }
+          } else {
+            grabAndDecode(el.video);
+          }
           if (curTotalFrames > 0 && curReceivedCount === curTotalFrames) completed = true;
         }
       }

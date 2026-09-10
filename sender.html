@@ -83,6 +83,7 @@
         <option value="10" selected>10</option>
         <option value="15">15</option>
         <option value="20">20</option>
+        <option value="30">30</option>
       </select>
     </label>
     <button id="start" class="primary" disabled>开始传输</button>
@@ -2419,7 +2420,9 @@ var qrcode = function() {
     var SHA_LEN = 64;
     var QUIET = 4;
     var HEADER_LEN = 23;
-    var CHUNK_MAX = 2953 - HEADER_LEN; // 2930
+    // 二维码内为 base64(整帧)，需保证 base64 后 <= 2953 字节。
+    // base64(2214 字节)=2952 字符，因此帧最多 2214 字节，chunk 最多 2191 字节。
+    var CHUNK_MAX = 2191;
 
     var COMPRESSED_EXT = /\.(zip|7z|rar|gz|bz2|xz|zst|jpg|jpeg|png|gif|webp|avif|heic|mp3|aac|ogg|opus|flac|mp4|mov|mkv|webm|avi|pdf|docx|xlsx|pptx|odt|ods|odp)$/i;
 
@@ -2501,10 +2504,14 @@ var qrcode = function() {
     function u16be(n) { return [n >>> 8, n & 0xff]; }
     function u32be(n) { return [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]; }
 
+    function bytesToBase64(bytes) {
+      return btoa(String.fromCharCode.apply(null, bytes));
+    }
+
     function encodeFrame(segIndex, segTotal, frameIndex, totalFrames, chunk) {
       var head = new Uint8Array(HEADER_LEN);
       head[0] = 0x46; head[1] = 0x54; head[2] = 0x30; head[3] = 0x31; // FT01
-      head[4] = 3;
+      head[4] = 4;
       head.set(u16be(segIndex), 5);
       head.set(u16be(segTotal), 7);
       head.set(u32be(frameIndex), 9);
@@ -2521,6 +2528,12 @@ var qrcode = function() {
       var stream = blob.stream().pipeThrough(new CompressionStream("deflate"));
       var buf = new Uint8Array(await new Response(stream).arrayBuffer());
       return buf.subarray(2, buf.length - 4);
+    }
+
+    async function deflateZlib(bytes) {
+      var blob = new Blob([bytes]);
+      var stream = blob.stream().pipeThrough(new CompressionStream("deflate"));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
     }
 
     async function deflateOrStore(bytes, name) {
@@ -2730,7 +2743,14 @@ var qrcode = function() {
         if (!text) throw new Error("请输入要传输的文字内容");
         var textBytes = new TextEncoder().encode(text);
         if (textBytes.length > MAX_TEXT_BYTES) throw new Error("文字内容过长（超过 1MB）");
-        return { payload: textBytes, downloadName: "文字内容.txt", kind: 1 };
+        var kind = 1;
+        if (typeof CompressionStream !== "undefined") {
+          try {
+            var compressed = await deflateZlib(textBytes);
+            if (compressed.length + 16 < textBytes.length) { textBytes = compressed; kind = 2; }
+          } catch (e) { /* keep raw text */ }
+        }
+        return { payload: textBytes, downloadName: "文字内容.txt", kind: kind };
       }
 
       var entries = [];
@@ -2875,7 +2895,7 @@ var qrcode = function() {
 
     function drawFrame(idx) {
       var frame = segments[currentSeg][idx];
-      var bin = String.fromCharCode.apply(null, frame);
+      var bin = bytesToBase64(frame);
       var qr = qrcode(40, "L");
       qr.addData(bin, "Byte");
       qr.make();
