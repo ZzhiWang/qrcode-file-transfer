@@ -80,8 +80,9 @@
     <button id="reset">重置</button>
     <label class="inline">识别精度
       <select id="scanWidth">
-        <option value="960">流畅（960）</option>
-        <option value="1280" selected>均衡（1280）</option>
+        <option value="640">极速（640）</option>
+        <option value="960" selected>流畅（960）</option>
+        <option value="1280">均衡（1280）</option>
         <option value="1920">高精度（1920）</option>
       </select>
     </label>
@@ -95,7 +96,9 @@
     </div>
     <div class="progressbar"><div id="progress"></div></div>
     <div class="statusbar">
-      <span>已收帧 <b id="got">0</b> / <span id="total">-</span></span>
+      <span>分片 <b id="segProg">-</b></span>
+      <span>已收分片 <b id="segDone">0</b></span>
+      <span>本分片帧 <b id="got">0</b> / <span id="total">-</span></span>
       <span>缺失 <b id="missing">0</b></span>
       <span>CRC 错误 <b id="crcErr">0</b></span>
       <span>识别帧率 <b id="fpsVal">0</b></span>
@@ -10219,9 +10222,9 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   (function () {
     "use strict";
 
-    var HEADER_LEN = 19;
+    var HEADER_LEN = 23;
     var SHA_LEN = 64;
-    var META_FIXED = 1 + 2 + 4 + SHA_LEN; // kind + nameLen + payloadLen + sha256 hex
+    var META_FIXED = 1 + 2 + 4 + SHA_LEN + 4 + SHA_LEN; // kind + nameLen + segLen + segSha + wholeLen + wholeSha
 
     var CRC_TABLE = (function () {
       var t = new Uint32Array(256);
@@ -10305,18 +10308,21 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       var need = META_FIXED + nameLen;
       if (bytes.length < need) return null;
       var name = new TextDecoder().decode(bytes.subarray(3, 3 + nameLen));
-      var payloadLen = ((bytes[3 + nameLen] << 24) | (bytes[3 + nameLen + 1] << 16) | (bytes[3 + nameLen + 2] << 8) | bytes[3 + nameLen + 3]) >>> 0;
-      var shaStart = 3 + nameLen + 4;
-      var shaHex = new TextDecoder().decode(bytes.subarray(shaStart, shaStart + SHA_LEN));
-      return { kind: kind, name: name, payloadLen: payloadLen, shaHex: shaHex, headerLen: need };
+      var segLen = ((bytes[3 + nameLen] << 24) | (bytes[3 + nameLen + 1] << 16) | (bytes[3 + nameLen + 2] << 8) | bytes[3 + nameLen + 3]) >>> 0;
+      var segShaStart = 3 + nameLen + 4;
+      var segSha = new TextDecoder().decode(bytes.subarray(segShaStart, segShaStart + SHA_LEN));
+      var wholeLen = ((bytes[segShaStart + SHA_LEN] << 24) | (bytes[segShaStart + SHA_LEN + 1] << 16) | (bytes[segShaStart + SHA_LEN + 2] << 8) | bytes[segShaStart + SHA_LEN + 3]) >>> 0;
+      var wholeSha = new TextDecoder().decode(bytes.subarray(segShaStart + SHA_LEN + 4, segShaStart + SHA_LEN + 4 + SHA_LEN));
+      return { kind: kind, name: name, segLen: segLen, segSha: segSha, wholeLen: wholeLen, wholeSha: wholeSha, headerLen: need };
     }
 
     // state
-    var received = {};
-    var receivedCount = 0;
-    var totalFrames = -1;
-    var meta = null;
-    var transferSig = null;
+    var segments = {};
+    var wholeMeta = null;
+    var currentSeg = -1;
+    var curReceived = {};
+    var curReceivedCount = 0;
+    var curTotalFrames = -1;
     var crcErrors = 0;
     var scanning = false;
     var rafId = null;
@@ -10338,6 +10344,8 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       reset: document.getElementById("reset"),
       scanWidth: document.getElementById("scanWidth"),
       progress: document.getElementById("progress"),
+      segProg: document.getElementById("segProg"),
+      segDone: document.getElementById("segDone"),
       got: document.getElementById("got"),
       total: document.getElementById("total"),
       missing: document.getElementById("missing"),
@@ -10355,12 +10363,15 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     };
 
     function resetTransfer() {
-      received = {};
-      receivedCount = 0;
-      totalFrames = -1;
-      meta = null;
-      transferSig = null;
+      segments = {};
+      wholeMeta = null;
+      currentSeg = -1;
+      curReceived = {};
+      curReceivedCount = 0;
+      curTotalFrames = -1;
       crcErrors = 0;
+      el.segProg.textContent = "-";
+      el.segDone.textContent = "0";
       el.total.textContent = "-";
       el.crcErr.textContent = "0";
       el.stateText.textContent = "等待扫描";
@@ -10376,84 +10387,109 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
 
     function updateProgress() {
-      var pct = totalFrames > 0 ? Math.round(receivedCount / totalFrames * 100) : 0;
+      var pct = curTotalFrames > 0 ? Math.round(curReceivedCount / curTotalFrames * 100) : 0;
       el.progress.style.width = pct + "%";
-      el.got.textContent = receivedCount;
-      el.missing.textContent = totalFrames > 0 ? totalFrames - receivedCount : 0;
+      el.got.textContent = curReceivedCount;
+      el.missing.textContent = curTotalFrames > 0 ? curTotalFrames - curReceivedCount : 0;
+      if (currentSeg >= 0 && wholeMeta) {
+        el.segProg.textContent = (currentSeg + 1) + " / " + wholeMeta.segTotal;
+        el.segDone.textContent = Object.keys(segments).length + " / " + wholeMeta.segTotal;
+      }
     }
 
     function handleFrame(bytes) {
       if (bytes.length < HEADER_LEN) return false;
-      if (bytes[0] !== 0x46 || bytes[1] !== 0x54 || bytes[2] !== 0x30 || bytes[3] !== 0x31 || bytes[4] !== 2) return false;
-      var frameIndex = ((bytes[5] << 24) | (bytes[6] << 16) | (bytes[7] << 8) | bytes[8]) >>> 0;
-      var tf = ((bytes[9] << 24) | (bytes[10] << 16) | (bytes[11] << 8) | bytes[12]) >>> 0;
-      var chunkLen = (bytes[13] << 8) | bytes[14];
-      var crc = ((bytes[15] << 24) | (bytes[16] << 16) | (bytes[17] << 8) | bytes[18]) >>> 0;
+      if (bytes[0] !== 0x46 || bytes[1] !== 0x54 || bytes[2] !== 0x30 || bytes[3] !== 0x31 || bytes[4] !== 3) return false;
+      var segIndex = (bytes[5] << 8) | bytes[6];
+      var segTotal = (bytes[7] << 8) | bytes[8];
+      var frameIndex = ((bytes[9] << 24) | (bytes[10] << 16) | (bytes[11] << 8) | bytes[12]) >>> 0;
+      var tf = ((bytes[13] << 24) | (bytes[14] << 16) | (bytes[15] << 8) | bytes[16]) >>> 0;
+      var chunkLen = (bytes[17] << 8) | bytes[18];
+      var crc = ((bytes[19] << 24) | (bytes[20] << 16) | (bytes[21] << 8) | bytes[22]) >>> 0;
       if (chunkLen !== bytes.length - HEADER_LEN) return false;
       var chunk = bytes.subarray(HEADER_LEN);
       if (crc32(chunk) !== crc) { crcErrors++; el.crcErr.textContent = crcErrors; return false; }
+      if (frameIndex >= tf || segIndex >= segTotal || tf <= 0 || segTotal <= 0) return false;
 
-      if (frameIndex >= tf) return false;
-      if (totalFrames !== -1 && tf !== totalFrames) resetTransfer();
+      if (wholeMeta && wholeMeta.segTotal !== segTotal) resetTransfer();
 
       if (frameIndex === 0) {
         var m = parseMeta(chunk);
         if (!m) return false;
-        if (transferSig !== null && transferSig !== m.shaHex) resetTransfer();
-        if (transferSig === null) {
-          transferSig = m.shaHex;
-          meta = m;
-          el.stateText.textContent = (el.scanMode.value === "video" ? "解析中：" : "扫描中：") + m.name;
+        if (wholeMeta && (wholeMeta.kind !== m.kind || wholeMeta.wholeSha !== m.wholeSha)) resetTransfer();
+        if (!wholeMeta) {
+          wholeMeta = { kind: m.kind, name: m.name, wholeLen: m.wholeLen, wholeSha: m.wholeSha, segTotal: segTotal };
         }
       }
 
-      if (totalFrames === -1) totalFrames = tf;
-      if (!received[frameIndex]) {
-        received[frameIndex] = chunk;
-        receivedCount++;
+      if (currentSeg !== segIndex) {
+        currentSeg = segIndex;
+        curReceived = {};
+        curReceivedCount = 0;
+        curTotalFrames = tf;
+      }
+
+      if (!curReceived[frameIndex]) {
+        curReceived[frameIndex] = chunk;
+        curReceivedCount++;
       }
       updateProgress();
-      if (receivedCount === totalFrames) assemble();
+      if (curReceivedCount === curTotalFrames) verifySegment(segIndex);
       return true;
     }
 
-    function assemble() {
+    function verifySegment(segIndex) {
+      if (segments[segIndex]) return;
       var parts = [];
-      for (var i = 0; i < totalFrames; i++) {
-        if (!received[i]) return;
-        parts.push(received[i]);
+      for (var i = 0; i < curTotalFrames; i++) {
+        if (!curReceived[i]) return;
+        parts.push(curReceived[i]);
       }
       var stream = concatBytes(parts);
       var m = parseMeta(stream);
-      if (!m) { el.stateText.textContent = "元数据解析失败"; return; }
+      if (!m) { el.stateText.textContent = "分片 " + (segIndex + 1) + " 元数据解析失败"; return; }
       var payload = stream.subarray(m.headerLen);
-      if (payload.length !== m.payloadLen) { el.stateText.textContent = "长度不匹配"; return; }
-      var calc = sha256Hex(payload);
-      if (calc !== m.shaHex) {
-        el.stateText.textContent = "SHA-256 校验失败";
-        return;
+      if (payload.length !== m.segLen) { el.stateText.textContent = "分片 " + (segIndex + 1) + " 长度不匹配"; return; }
+      if (sha256Hex(payload) !== m.segSha) { el.stateText.textContent = "分片 " + (segIndex + 1) + " 校验失败"; return; }
+      segments[segIndex] = payload;
+      updateProgress();
+      if (Object.keys(segments).length === wholeMeta.segTotal) {
+        finalize();
+      } else {
+        el.stateText.textContent = "分片 " + (segIndex + 1) + " 接收成功，请在发送端点击「下一分片」";
       }
-      el.stateText.textContent = "校验通过，可以保存";
-      if (m.kind === 1) {
+    }
+
+    function finalize() {
+      var parts = [];
+      for (var i = 0; i < wholeMeta.segTotal; i++) {
+        if (!segments[i]) { el.stateText.textContent = "缺少分片 " + (i + 1); return; }
+        parts.push(segments[i]);
+      }
+      var payload = concatBytes(parts);
+      if (payload.length !== wholeMeta.wholeLen) { el.stateText.textContent = "整文件长度不匹配"; return; }
+      if (sha256Hex(payload) !== wholeMeta.wholeSha) { el.stateText.textContent = "整文件 SHA-256 校验失败"; return; }
+      el.stateText.textContent = "全部接收完成，校验通过";
+      if (wholeMeta.kind === 1) {
         var text = new TextDecoder().decode(payload);
         el.textOut.value = text;
         var textBlob = new Blob([payload], { type: "text/plain;charset=utf-8" });
         el.saveTextLink.href = URL.createObjectURL(textBlob);
-        el.saveTextLink.download = m.name || "文字内容.txt";
+        el.saveTextLink.download = wholeMeta.name || "文字内容.txt";
         el.fileAction.style.display = "none";
         el.textAction.style.display = "block";
         el.doneInfo.innerHTML = "文字内容（UTF-8）：<br>" +
           "大小：" + fmtSize(payload.length) + "<br>" +
-          "SHA-256：<span class='mono'>" + m.shaHex + "</span>";
+          "SHA-256：<span class='mono'>" + wholeMeta.wholeSha + "</span>";
       } else {
         var blob = new Blob([payload], { type: "application/zip" });
         el.saveLink.href = URL.createObjectURL(blob);
-        el.saveLink.download = m.name;
+        el.saveLink.download = wholeMeta.name;
         el.fileAction.style.display = "block";
         el.textAction.style.display = "none";
-        el.doneInfo.innerHTML = "文件名：<b>" + escapeHtml(m.name) + "</b><br>" +
+        el.doneInfo.innerHTML = "文件名：<b>" + escapeHtml(wholeMeta.name) + "</b><br>" +
           "大小：" + fmtSize(payload.length) + "<br>" +
-          "SHA-256：<span class='mono'>" + m.shaHex + "</span>";
+          "SHA-256：<span class='mono'>" + wholeMeta.wholeSha + "</span>";
       }
       el.doneBox.style.display = "block";
       el.doneBox.scrollIntoView({ block: "nearest" });
@@ -10602,16 +10638,16 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         for (var t = 0; t <= duration && !completed && !parseAborted; t += stepSec) {
           await seekTo(el.video, Math.min(t, duration));
           grabAndDecode(el.video);
-          if (totalFrames > 0 && receivedCount === totalFrames) completed = true;
+          if (curTotalFrames > 0 && curReceivedCount === curTotalFrames) completed = true;
         }
       }
       el.video.pause();
       if (parseAborted) {
         el.stateText.textContent = "已停止解析";
       } else if (completed) {
-        el.stateText.textContent = "解析完成，可以保存";
+        // 保留 verifySegment / finalize 已写入的提示
       } else {
-        el.stateText.textContent = "视频解析结束：" + receivedCount + "/" + (totalFrames > 0 ? totalFrames : "?") + "，缺帧可重新选择更完整的视频";
+        el.stateText.textContent = "视频解析结束：当前分片已收 " + curReceivedCount + "/" + (curTotalFrames > 0 ? curTotalFrames : "?") + "，缺帧可重新选择更完整的视频";
       }
     }
 
